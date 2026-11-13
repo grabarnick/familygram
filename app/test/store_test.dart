@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 
 import 'package:familygram/data/api.dart';
+import 'package:familygram/data/callkit.dart';
 import 'package:familygram/data/models.dart';
 import 'package:familygram/data/push.dart';
 import 'package:familygram/data/realtime.dart';
@@ -295,11 +296,19 @@ void main() {
 
   group('push notifications', () {
     late List<Map<String, dynamic>> devices;
+    late List<String> posted;
 
-    Future<AppStore> signedIn(FakePush push) async {
+    Future<AppStore> signedIn(FakePush push, {FakeCallKit? callKit}) async {
       devices = [];
+      posted = [];
       final client = MockClient((req) async {
+        if (req.method == 'POST') posted.add(req.url.path);
+        if (req.url.path.startsWith('/api/calls/')) return http.Response('{}', 200);
         switch (req.url.path) {
+          case '/api/info':
+            return http.Response(jsonEncode({'name': 'F', 'auth': 'sms', 'calls': true}), 200);
+          case '/api/calls':
+            return http.Response('[]', 200);
           case '/api/auth/request-code':
             return http.Response(jsonEncode({'retry_after': 60}), 200);
           case '/api/auth/verify':
@@ -332,6 +341,7 @@ void main() {
         realtimeFactory: (api) => Realtime(() => api.wsUri,
             connector: (_) => throw UnsupportedError('no ws in tests')),
         push: push,
+        callKit: callKit,
       );
       await store.init();
       await store.requestCode('family.example.ru', '+79990000002');
@@ -344,9 +354,133 @@ void main() {
       final store = await signedIn(FakePush(registration: const PushRegistration(
           platform: 'ios', token: 'abcd1234', sandbox: true)));
       expect(devices, [
-        {'platform': 'ios', 'token': 'abcd1234', 'sandbox': true}
+        {'platform': 'ios', 'token': 'abcd1234', 'sandbox': true, 'kind': 'alert'}
       ]);
       store.dispose();
+    });
+
+    // ---- incoming calls on the system call screen (CallKit) ----
+
+    const sandboxPush = PushRegistration(platform: 'ios', token: 'abcd1234', sandbox: true);
+
+    Map<String, dynamic> ringing(int id) => {
+          'id': id,
+          'chat_id': 1,
+          'initiator_id': 1,
+          'video': false,
+          'state': 'ringing',
+          'participant_ids': [1],
+          'created_at': 1794560000000,
+        };
+
+    test('the VoIP token is registered and CallKit rings instead of the app', () async {
+      final ck = FakeCallKit(token: 'f00d');
+      final store = await signedIn(FakePush(registration: sandboxPush), callKit: ck);
+      expect(devices, contains(equals({'platform': 'ios', 'token': 'f00d', 'sandbox': true, 'kind': 'voip'})));
+      expect(store.callKitRings, isTrue);
+      store.applyEvent(RealtimeEvent(RealtimeEvent.callRing, ringing(7)));
+      expect(store.incomingCall, isNull, reason: 'no second ring in the app');
+      store.dispose();
+    });
+
+    test('without a VoIP token the app shows its own incoming screen', () async {
+      final store = await signedIn(FakePush(registration: sandboxPush), callKit: FakeCallKit(token: null));
+      expect(store.callKitRings, isFalse);
+      store.applyEvent(RealtimeEvent(RealtimeEvent.callRing, ringing(7)));
+      expect(store.incomingCall?.id, 7);
+      store.dispose();
+    });
+
+    test('a VoIP token issued later is registered then', () async {
+      final ck = FakeCallKit(token: null);
+      final store = await signedIn(FakePush(registration: sandboxPush), callKit: ck);
+      ck.token = 'beef';
+      ck.emit(const CallKitAction(CallKitActionKind.tokenUpdated));
+      await pumpEventQueue();
+      expect(devices.where((d) => d['kind'] == 'voip').single['token'], 'beef');
+      expect(store.callKitRings, isTrue);
+      store.dispose();
+    });
+
+    test('accept / decline / hang up on the system screen', () async {
+      final ck = FakeCallKit(token: 'f00d');
+      final store = await signedIn(FakePush(registration: sandboxPush), callKit: ck);
+
+      ck.emit(const CallKitAction(CallKitActionKind.accept, 7));
+      await pumpEventQueue();
+      expect(store.takeCallKitAcceptRequest(), 7);
+
+      ck.emit(const CallKitAction(CallKitActionKind.decline, 8));
+      await pumpEventQueue();
+      expect(posted, contains('/api/calls/8/decline'));
+
+      // Hanging up on the lock screen asks the open call screen to hang up.
+      final c = (await store.findLiveCall(9)) ?? Call.fromJson({...ringing(9), 'state': 'active'});
+      store.debugSetActiveCall(c);
+      ck.emit(const CallKitAction(CallKitActionKind.ended, 9));
+      await pumpEventQueue();
+      expect(store.callKitEndRequest, 9);
+      await store.leaveCall();
+      expect(store.callKitEndRequest, isNull);
+      expect(ck.ended, contains(9), reason: 'leaving takes the call off the system screen');
+      store.dispose();
+    });
+
+    test('accept goes straight to the UI handler, without waiting for a redraw', () async {
+      final ck = FakeCallKit(token: 'f00d');
+      final store = await signedIn(FakePush(registration: sandboxPush), callKit: ck);
+      final joined = <int>[];
+      store.onCallKitAccept = joined.add;
+      ck.emit(const CallKitAction(CallKitActionKind.accept, 7));
+      await pumpEventQueue();
+      expect(joined, [7]);
+      expect(store.callKitAcceptRequest, isNull);
+      store.dispose();
+    });
+
+    test('our own answer does not close the system screen (event before reply)', () async {
+      final ck = FakeCallKit(token: 'f00d');
+      final store = await signedIn(FakePush(registration: sandboxPush), callKit: ck);
+      store.onCallKitAccept = (_) {}; // the UI is now joining
+      ck.emit(const CallKitAction(CallKitActionKind.accept, 7));
+      await pumpEventQueue();
+      // The server's "active" event arrives before the reply to our join.
+      store.applyEvent(RealtimeEvent(RealtimeEvent.callUpdated,
+          {...ringing(7), 'state': 'active', 'participant_ids': [1, 2]}));
+      expect(ck.ended, isEmpty);
+      store.dispose();
+    });
+
+    test('a 1:1 call answered on another phone stops ringing here', () async {
+      final ck = FakeCallKit(token: 'f00d');
+      final store = await signedIn(FakePush(registration: sandboxPush), callKit: ck);
+      store.applyEvent(RealtimeEvent(RealtimeEvent.callRing, ringing(7)));
+      store.applyEvent(RealtimeEvent(RealtimeEvent.callUpdated,
+          {...ringing(7), 'state': 'active', 'participant_ids': [1, 2]}));
+      expect(ck.ended, [7]);
+      store.dispose();
+    });
+
+    test('a call that ends while ringing is taken off the system screen', () async {
+      final ck = FakeCallKit(token: 'f00d');
+      final store = await signedIn(FakePush(registration: sandboxPush), callKit: ck);
+      store.applyEvent(RealtimeEvent(RealtimeEvent.callRing, ringing(7)));
+      store.applyEvent(RealtimeEvent(RealtimeEvent.callEnded, {...ringing(7), 'state': 'missed'}));
+      expect(ck.ended, [7]);
+      store.dispose();
+    });
+
+    test('an accept that launched the app is picked up after sign-in', () async {
+      final ck = FakeCallKit(token: 'f00d')..accepted = [12];
+      final store = await signedIn(FakePush(registration: sandboxPush), callKit: ck);
+      expect(store.callKitAcceptRequest, 12);
+      store.dispose();
+    });
+
+    test('CallKit UUID matches the server and round-trips', () {
+      expect(callKitUuid(255), '00000000-0000-4000-8000-0000000000ff');
+      expect(callIdFromCallKitUuid(callKitUuid(123456)), 123456);
+      expect(callIdFromCallKitUuid('E621E1F8-C36C-495A-93FC-0C247A3E6E5F'), isNull);
     });
 
     test('declined notifications: nothing is registered', () async {
@@ -425,4 +559,27 @@ class FakePush implements PushService {
 
   @override
   Future<void> setBadge(int count) async => badges.add(count);
+}
+
+class FakeCallKit implements CallKitService {
+  FakeCallKit({required this.token});
+
+  String? token;
+  List<int> accepted = [];
+  final ended = <int>[];
+  final _actions = StreamController<CallKitAction>.broadcast();
+
+  void emit(CallKitAction a) => _actions.add(a);
+
+  @override
+  Future<String?> voipToken() async => token;
+
+  @override
+  Stream<CallKitAction> get actions => _actions.stream;
+
+  @override
+  Future<List<int>> acceptedCalls() async => accepted;
+
+  @override
+  Future<void> endCall(int callId) async => ended.add(callId);
 }

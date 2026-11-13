@@ -10,6 +10,12 @@ import 'ui/call/incoming_call.dart';
 import 'ui/home/home_screen.dart';
 import 'ui/theme.dart';
 
+/// Entry point of the tiny engine that iOS starts only to host CallKit when a
+/// call's VoIP push arrives before the app's UI (ios/Runner/AppDelegate.swift).
+/// The real app starts in [main]; this one does nothing.
+@pragma('vm:entry-point')
+void callkitHostMain() {}
+
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
   runApp(
@@ -57,14 +63,23 @@ class _RootGateState extends State<RootGate> {
     onResume: () => context.read<AppStore>().onAppResumed(),
   );
 
+  late final AppStore _store = context.read<AppStore>();
+
   @override
   void initState() {
     super.initState();
     _lifecycle; // create the listener
+    // Answered on the system call screen: join immediately (see the store).
+    _store.onCallKitAccept = (id) {
+      if (mounted) CallController.acceptFromCallKit(context, id);
+    };
+    final pending = _store.takeCallKitAcceptRequest();
+    if (pending != null) _store.onCallKitAccept!(pending);
   }
 
   @override
   void dispose() {
+    _store.onCallKitAccept = null;
     _lifecycle.dispose();
     super.dispose();
   }

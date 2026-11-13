@@ -10,6 +10,7 @@ import '../../data/store.dart';
 import '../format.dart';
 import '../theme.dart';
 import '../widgets/avatar.dart';
+import 'call_connection.dart';
 
 /// Colors of the dark in-call screen (from the Call artboard).
 class _C {
@@ -27,12 +28,17 @@ bool get _isMobile =>
     (defaultTargetPlatform == TargetPlatform.iOS ||
         defaultTargetPlatform == TargetPlatform.android);
 
-/// In-call screen: connects to LiveKit and shows participants and controls.
+/// In-call screen: shows participants and controls of a LiveKit call.
 class CallScreen extends StatefulWidget {
-  const CallScreen({super.key, required this.join, this.startWithVideo = false});
+  const CallScreen({super.key, required this.join, this.startWithVideo = false, this.connection});
 
   final CallJoin join;
   final bool startWithVideo;
+
+  /// Already started connection (CallController starts it before the screen
+  /// so a call answered on the lock screen talks right away); if null, the
+  /// screen connects itself.
+  final CallConnection? connection;
 
   @override
   State<CallScreen> createState() => _CallScreenState();
@@ -73,9 +79,9 @@ class _CallScreenState extends State<CallScreen> {
   }
 
   Future<void> _connect() async {
-    final room = lk.Room(
-      roomOptions: const lk.RoomOptions(adaptiveStream: true, dynacast: true),
-    );
+    final conn = widget.connection ??
+        CallConnection.start(widget.join, video: widget.startWithVideo, forceRelay: _store.forceRelay);
+    final room = conn.room;
     _room = room;
     _listener = room.createListener()
       ..on<lk.RoomReconnectingEvent>((_) => _set(() => _reconnecting = true))
@@ -90,46 +96,22 @@ class _CallScreenState extends State<CallScreen> {
       ..on<lk.TrackMutedEvent>((_) => _set(() {}))
       ..on<lk.TrackUnmutedEvent>((_) => _set(() {}))
       ..on<lk.LocalTrackPublishedEvent>((_) => _set(() {}));
-    try {
-      await room.connect(
-        widget.join.livekitUrl,
-        widget.join.token,
-        connectOptions: lk.ConnectOptions(
-          rtcConfiguration: lk.RTCConfiguration(
-            iceTransportPolicy: _store.forceRelay
-                ? lk.RTCIceTransportPolicy.relay
-                : lk.RTCIceTransportPolicy.all,
-          ),
-        ),
-      );
-    } catch (e) {
+    final r = await conn.ready;
+    if (r.error != null) {
       _set(() {
         _connecting = false;
-        _error = 'Не удалось подключиться к звонку. '
-            'Попробуйте включить «Звонки только через сервер» в настройках.';
+        _error = r.error;
       });
       return;
     }
-    // Device problems must not look like a broken connection: the call goes on.
-    try {
-      await room.localParticipant?.setMicrophoneEnabled(true);
-    } catch (_) {
-      _micOn = false;
-      _deviceWarning = 'Нет доступа к микрофону — проверьте разрешения';
+    _micOn = r.micOn;
+    _camOn = r.camOn;
+    _deviceWarning = r.deviceWarning;
+    // Hung up (or disconnected) while still connecting: nothing to show.
+    if (room.connectionState == lk.ConnectionState.disconnected && !_closing) {
+      _hangUp();
+      return;
     }
-    try {
-      if (_camOn) {
-        try {
-          await room.localParticipant?.setCameraEnabled(true);
-        } catch (_) {
-          _camOn = false;
-          _deviceWarning ??= 'Нет доступа к камере — проверьте разрешения';
-        }
-      }
-      if (_isMobile) {
-        await lk.AudioManager.instance.setSpeakerOutputPreferred(_speakerOn);
-      }
-    } catch (_) {}
     _onParticipants();
     _set(() => _connecting = false);
   }
@@ -154,6 +136,10 @@ class _CallScreenState extends State<CallScreen> {
     final c = _store.activeCall;
     // The server ended the call (declined, missed or everyone left).
     if (c != null && c.id == widget.join.call.id && !c.isLive) {
+      _hangUp();
+    }
+    // Hung up on the system call screen (CallKit), e.g. from the lock screen.
+    if (_store.callKitEndRequest == widget.join.call.id) {
       _hangUp();
     }
   }

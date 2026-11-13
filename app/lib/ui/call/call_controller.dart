@@ -1,9 +1,12 @@
+import 'dart:async';
+
 import 'package:material_ui/material_ui.dart';
 import 'package:provider/provider.dart';
 
 import '../../data/api.dart';
 import '../../data/models.dart';
 import '../../data/store.dart';
+import 'call_connection.dart';
 import 'call_screen.dart';
 
 /// Root navigator, so calls can be opened from anywhere (incoming overlay).
@@ -27,10 +30,23 @@ class CallController {
 
   /// Accepts an incoming call or joins an active one.
   static Future<void> join(BuildContext context, Call call) =>
-      _open(context, () => _store(context).joinCall(call), call.video);
+      _open(context, () => _store(context).joinCall(call), call.video, callId: call.id);
+
+  /// The person answered on the system call screen (CallKit).
+  static Future<void> acceptFromCallKit(BuildContext context, int callId) async {
+    final store = _store(context);
+    final call = await store.findLiveCall(callId);
+    if (call == null) {
+      // The caller hung up while the phone was waking up.
+      store.callKitCallGone(callId);
+      if (context.mounted) _snack(context, 'Звонок уже завершён');
+      return;
+    }
+    if (context.mounted) await join(context, call);
+  }
 
   static Future<void> _open(
-      BuildContext context, Future<CallJoin> Function() connect, bool video) async {
+      BuildContext context, Future<CallJoin> Function() connect, bool video, {int? callId}) async {
     if (_screenOpen) {
       _snack(context, 'Вы уже в звонке');
       return;
@@ -47,17 +63,40 @@ class CallController {
       join = await connect();
     } on ApiException catch (e) {
       // 409: the call ended before we answered.
-      if (e.status == 409) store.dismissIncoming();
+      if (e.status == 409) {
+        store.dismissIncoming();
+        if (callId != null) store.callKitCallGone(callId); // stop the system screen too
+      }
       messenger?.showSnackBar(SnackBar(content: Text(e.message)));
       return;
     }
+    // Connect now, not when the screen is first drawn: a call answered on the
+    // lock screen must talk before the phone is unlocked.
+    final conn = CallConnection.start(join, video: video, forceRelay: store.forceRelay);
+    final route = MaterialPageRoute<void>(
+      fullscreenDialog: true,
+      builder: (_) => CallScreen(join: join, startWithVideo: video, connection: conn),
+    );
+    // Hung up on the system call screen, or the call ended, possibly before
+    // the call screen was ever drawn (phone still locked): tear down here.
+    var closed = false;
+    void onStore() {
+      final c = store.activeCall;
+      final endedHere = store.callKitEndRequest == join.call.id;
+      final endedThere = c != null && c.id == join.call.id && !c.isLive;
+      if (closed || !(endedHere || endedThere)) return;
+      closed = true;
+      unawaited(conn.room.disconnect().catchError((_) {}));
+      unawaited(store.leaveCall());
+      if (route.isActive) nav.removeRoute(route);
+    }
+
+    store.addListener(onStore);
     _screenOpen = true;
     try {
-      await nav.push(MaterialPageRoute<void>(
-        fullscreenDialog: true,
-        builder: (_) => CallScreen(join: join, startWithVideo: video),
-      ));
+      await nav.push(route);
     } finally {
+      store.removeListener(onStore);
       _screenOpen = false;
     }
   }

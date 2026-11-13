@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -31,10 +32,21 @@ type fakePusher struct {
 	calls []pushCall
 	gone  map[string]bool
 	ch    chan pushCall
+	rings chan ringCall
+}
+
+type ringCall struct {
+	Device PushDevice
+	Call   CallPush
 }
 
 func newFakePusher() *fakePusher {
-	return &fakePusher{gone: map[string]bool{}, ch: make(chan pushCall, 16)}
+	return &fakePusher{gone: map[string]bool{}, ch: make(chan pushCall, 16), rings: make(chan ringCall, 16)}
+}
+
+func (f *fakePusher) PushCall(_ context.Context, d PushDevice, c CallPush) error {
+	f.rings <- ringCall{d, c}
+	return nil
 }
 
 func (f *fakePusher) Push(_ context.Context, d PushDevice, n PushNote) error {
@@ -256,6 +268,20 @@ func TestAPNsPusher(t *testing.T) {
 		t.Fatal("provider token re-signed for each push")
 	}
 
+	// VoIP: separate ".voip" topic and push type, never stored for later.
+	cp := CallPush{UUID: callUUID(5), CallID: 5, ChatID: 7, CallerName: "Папа", Title: "Папа", Video: true}
+	if err := p.PushCall(context.Background(), PushDevice{Token: "voip1", Sandbox: true}, cp); err != nil {
+		t.Fatal(err)
+	}
+	v := reqs[2]
+	if v.path != "/sandbox/3/device/voip1" || v.hdr.Get("apns-topic") != "org.familygram.familygram.voip" ||
+		v.hdr.Get("apns-push-type") != "voip" || v.hdr.Get("apns-expiration") != "0" {
+		t.Fatalf("voip request: %s %v", v.path, v.hdr)
+	}
+	if v.body["uuid"] != callUUID(5) || v.body["call_id"] != float64(5) || v.body["caller_name"] != "Папа" || v.body["video"] != true {
+		t.Fatalf("voip payload: %v", v.body)
+	}
+
 	if _, err := newAPNsPusher([]byte("junk"), "K", "T", "x"); err == nil {
 		t.Fatal("accepted a non-PEM key")
 	}
@@ -279,3 +305,45 @@ func waitFor(t *testing.T, ok func() bool) {
 }
 
 func itoa(n int64) string { b, _ := json.Marshal(n); return string(b) }
+
+const momVoIPToken = "cc00000000000000000000000000000000000000000000000000000000000003"
+
+func TestPushCallRingAndMissed(t *testing.T) {
+	e := newCallEnv(t)
+	e.app.calls.ringTimeout = 150 * time.Millisecond
+	fp := newFakePusher()
+	e.app.push = fp
+	a, b, _, ua, ub, _ := e.family()
+	e.registerDevice(b, momPhoneToken)
+	e.must(200, "POST", "/api/devices", b, map[string]any{"platform": "ios", "token": momVoIPToken, "sandbox": true, "kind": "voip"}, nil)
+	e.must(400, "POST", "/api/devices", b, map[string]any{"platform": "ios", "token": momVoIPToken, "kind": "sms"}, nil)
+	ch := e.directChat(a, ub.ID)
+
+	// Dad calls: only Mom's VoIP token rings (not her message token).
+	var join CallJoin
+	e.must(200, "POST", fmt.Sprintf("/api/chats/%d/call", ch.ID), a, map[string]any{"video": true}, &join)
+	var ring ringCall
+	select {
+	case ring = <-fp.rings:
+	case <-time.After(2 * time.Second):
+		t.Fatal("no VoIP push")
+	}
+	want := CallPush{UUID: callUUID(join.Call.ID), CallID: join.Call.ID, ChatID: ch.ID,
+		CallerName: ua.DisplayName, Title: ua.DisplayName, Video: true}
+	if ring.Device.Token != momVoIPToken || ring.Device.Kind != pushKindVoIP || ring.Call != want {
+		t.Fatalf("ring = %+v", ring)
+	}
+
+	// Nobody answers: Mom gets a visible "missed call" notification.
+	got := fp.next(t)
+	if got.Device.Token != momPhoneToken || got.Note.Title != ua.DisplayName || got.Note.Body != "📹 Пропущенный видеозвонок" {
+		t.Fatalf("missed-call push = %+v", got)
+	}
+	fp.none(t)
+}
+
+func TestCallUUID(t *testing.T) {
+	if got := callUUID(255); got != "00000000-0000-4000-8000-0000000000ff" {
+		t.Fatal(got)
+	}
+}

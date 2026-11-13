@@ -233,6 +233,11 @@ func (app *App) endLocked(ctx context.Context, c *Call, state string) error {
 	app.broadcastChat(ctx, fresh.ChatID, "call.ended", fresh, 0)
 	if m, err := app.getMessage(ctx, msgID); err == nil {
 		app.broadcastChat(ctx, fresh.ChatID, "message.new", m, 0)
+		if state == callMissed {
+			if caller, err := app.getUser(ctx, c.InitiatorID); err == nil {
+				app.notifyNewMessage(m, caller) // "missed call" notification
+			}
+		}
 	}
 	return nil
 }
@@ -428,6 +433,7 @@ func (app *App) handleStartCall(w http.ResponseWriter, r *http.Request, u *User)
 	}
 	app.startRingTimer(callID)
 	app.broadcastChat(ctx, chatID, "call.ring", c, u.ID)
+	app.notifyCallRing(c, u)
 	writeJSON(w, http.StatusOK, &CallJoin{Call: c, LiveKitURL: app.cfg.LiveKitURL, Token: token})
 	return nil
 }

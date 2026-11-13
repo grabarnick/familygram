@@ -133,6 +133,10 @@ func openDB(path string) (*sql.DB, error) {
 	if err := addColumn(db, "messages", "call_id", "INTEGER REFERENCES calls(id)"); err != nil {
 		return nil, fmt.Errorf("migrate: %w", err)
 	}
+	// "alert": message notifications; "voip": incoming-call pushes (iOS PushKit).
+	if err := addColumn(db, "push_devices", "kind", "TEXT NOT NULL DEFAULT 'alert'"); err != nil {
+		return nil, fmt.Errorf("migrate: %w", err)
+	}
 	return db, nil
 }
 

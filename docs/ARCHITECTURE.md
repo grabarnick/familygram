@@ -92,7 +92,7 @@ ID сообщений — монотонные int64 (пагинация `before
 | POST   | /api/files                        | multipart `file` (+ width/height/duration)|
 | GET    | /api/files/{id}                   | скачать (поддерживает Range)              |
 | GET    | /api/ws                           | WebSocket событий                         |
-| POST   | /api/devices                      | `{platform:"ios",token,sandbox}` — телефон для push; привязан к сессии, удаляется при выходе |
+| POST   | /api/devices                      | `{platform:"ios",token,sandbox,kind}` — телефон для push (`kind`: `alert` — сообщения, `voip` — входящие звонки); привязан к сессии, удаляется при выходе. Ответ `{ok, push}`: `push=false`, если на сервере нет ключа APNs |
 
 События WebSocket (сервер → клиент): `message.new`, `message.deleted`,
 `chat.new`, `chat.read`, `typing`. Клиент → сервер: `typing`, позже —
@@ -202,8 +202,18 @@ iOS/Android/Web (`livekit_client`). Familygram-сервер отвечает т�
 `call.ended` (Call). По завершении в чат пишется сообщение `kind:"call"` с полем
 `"call":{"id","video","state","duration_ms"}` («Видеозвонок · 2:14», «Пропущенный звонок»).
 
-Ограничение этапа 2: входящий звонок звонит, только пока приложение открыто
-(WebSocket). Звонок на закрытом телефоне — этап 3 (VoIP push + CallKit / FCM + ConnectionService).
+Звонок на закрытый iPhone (этап 3): при `call.ring` сервер шлёт участникам VoIP-push
+(PushKit, тема `<bundle>.voip`, `apns-push-type: voip`, `apns-expiration: 0`) с
+`{uuid, call_id, chat_id, caller_name, title, video}`. `uuid` — детерминированный UUID
+звонка `00000000-0000-4000-8000-<id hex>`, одинаково считается на сервере и в клиенте.
+iOS обязана сразу показать такой push в CallKit, иначе перестаёт будить приложение;
+если UI-движок Flutter ещё не запущен, `AppDelegate.swift` поднимает минимальный движок
+(`callkitHostMain`, пустая Dart-функция) только чтобы зарегистрировать плагин CallKit.
+Клиент: ответ в CallKit сразу вызывает `join` и подключает LiveKit вне экрана
+(`CallConnection`), потому что на заблокированном телефоне кадры не рисуются; экран
+звонка подхватывает готовое соединение. Пока звонит системный экран, внутреннее
+окно входящего звонка не показывается. Звонок, закончившийся без ответа, приходит
+обычным push «Пропущенный звонок». Android (FCM + ConnectionService) — позже.
 
 ## Push-уведомления (этап 3)
 

@@ -115,8 +115,13 @@ class ApiClient {
   // ---- server & auth ----
 
   /// Registers this phone for push notifications (tied to the session).
-  Future<void> registerDevice({required String platform, required String token, required bool sandbox}) async {
-    await _send('POST', '/api/devices', body: {'platform': platform, 'token': token, 'sandbox': sandbox});
+  /// [kind] "alert" for messages, "voip" for incoming calls. Returns whether
+  /// the server can actually push (it has an APNs key).
+  Future<bool> registerDevice(
+      {required String platform, required String token, required bool sandbox, String kind = 'alert'}) async {
+    final r = await _send('POST', '/api/devices',
+        body: {'platform': platform, 'token': token, 'sandbox': sandbox, 'kind': kind});
+    return r is Map && r['push'] == true;
   }
 
   Future<ServerInfo> info() async =>

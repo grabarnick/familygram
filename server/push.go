@@ -31,8 +31,29 @@ import (
 type PushDevice struct {
 	Token    string
 	Platform string // "ios"
+	Kind     string // pushKindAlert or pushKindVoIP
 	Sandbox  bool   // development-signed build → APNs sandbox
 }
+
+const (
+	pushKindAlert = "alert" // visible notifications (messages, missed calls)
+	pushKindVoIP  = "voip"  // iOS PushKit: wakes the app to ring via CallKit
+)
+
+// CallPush wakes a phone for an incoming call; iOS shows its native call
+// screen (CallKit) even when the app is closed or the phone is locked.
+type CallPush struct {
+	UUID       string // CallKit call id, derived from the call id (callUUID)
+	CallID     int64
+	ChatID     int64
+	CallerName string
+	Title      string // caller name, or the group title
+	Video      bool
+}
+
+// callUUID is a stable UUID for a call, so the server and the phone agree on
+// which CallKit call to end without storing anything.
+func callUUID(id int64) string { return fmt.Sprintf("00000000-0000-4000-8000-%012x", id) }
 
 // PushNote is what the phone shows for a new message.
 type PushNote struct {
@@ -48,6 +69,7 @@ var errPushGone = errors.New("push token no longer valid")
 
 type Pusher interface {
 	Push(ctx context.Context, d PushDevice, n PushNote) error
+	PushCall(ctx context.Context, d PushDevice, c CallPush) error
 }
 
 // ---- device registration ----
@@ -57,6 +79,7 @@ func (app *App) handleRegisterDevice(w http.ResponseWriter, r *http.Request, u *
 		Platform string `json:"platform"`
 		Token    string `json:"token"`
 		Sandbox  bool   `json:"sandbox"`
+		Kind     string `json:"kind"`
 	}
 	if err := readJSON(r, &req); err != nil {
 		return err
@@ -64,17 +87,23 @@ func (app *App) handleRegisterDevice(w http.ResponseWriter, r *http.Request, u *
 	if req.Platform != "ios" {
 		return errStatus(http.StatusBadRequest, "unsupported platform")
 	}
+	if req.Kind == "" {
+		req.Kind = pushKindAlert
+	}
+	if req.Kind != pushKindAlert && req.Kind != pushKindVoIP {
+		return errStatus(http.StatusBadRequest, "unsupported kind")
+	}
 	tok := strings.ToLower(strings.TrimSpace(req.Token))
 	if b, err := hex.DecodeString(tok); err != nil || len(b) < 16 || len(b) > 100 {
 		return errStatus(http.StatusBadRequest, "invalid token")
 	}
 	// A token belongs to one phone; if someone else signed in on it before,
 	// it now follows the current session.
-	_, err := app.db.ExecContext(r.Context(), `INSERT INTO push_devices (token, user_id, session_hash, platform, sandbox, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?)
+	_, err := app.db.ExecContext(r.Context(), `INSERT INTO push_devices (token, user_id, session_hash, platform, kind, sandbox, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(token) DO UPDATE SET user_id = excluded.user_id, session_hash = excluded.session_hash,
-			platform = excluded.platform, sandbox = excluded.sandbox, updated_at = excluded.updated_at`,
-		tok, u.ID, hashToken(requestToken(r)), req.Platform, req.Sandbox, nowMs())
+			platform = excluded.platform, kind = excluded.kind, sandbox = excluded.sandbox, updated_at = excluded.updated_at`,
+		tok, u.ID, hashToken(requestToken(r)), req.Platform, req.Kind, req.Sandbox, nowMs())
 	if err != nil {
 		return err
 	}
@@ -82,8 +111,8 @@ func (app *App) handleRegisterDevice(w http.ResponseWriter, r *http.Request, u *
 	return nil
 }
 
-func (app *App) pushDevices(ctx context.Context, uid int64) ([]PushDevice, error) {
-	rows, err := app.db.QueryContext(ctx, `SELECT token, platform, sandbox FROM push_devices WHERE user_id = ?`, uid)
+func (app *App) pushDevices(ctx context.Context, uid int64, kind string) ([]PushDevice, error) {
+	rows, err := app.db.QueryContext(ctx, `SELECT token, platform, kind, sandbox FROM push_devices WHERE user_id = ? AND kind = ?`, uid, kind)
 	if err != nil {
 		return nil, err
 	}
@@ -91,7 +120,7 @@ func (app *App) pushDevices(ctx context.Context, uid int64) ([]PushDevice, error
 	var out []PushDevice
 	for rows.Next() {
 		var d PushDevice
-		if err := rows.Scan(&d.Token, &d.Platform, &d.Sandbox); err != nil {
+		if err := rows.Scan(&d.Token, &d.Platform, &d.Kind, &d.Sandbox); err != nil {
 			return nil, err
 		}
 		out = append(out, d)
@@ -135,6 +164,11 @@ func messagePreview(m *Message) string {
 			name = m.File.Name
 		}
 		s = withCaption("📎 " + name)
+	case "call":
+		s = "📞 Пропущенный звонок"
+		if m.Call != nil && m.Call.Video {
+			s = "📹 Пропущенный видеозвонок"
+		}
 	default:
 		s = caption
 	}
@@ -147,7 +181,12 @@ func messagePreview(m *Message) string {
 // notifyNewMessage pushes m to every other chat member's phones. It runs in
 // the background so sending a message never waits for Apple.
 func (app *App) notifyNewMessage(m *Message, sender *User) {
-	if app.push == nil || m.Kind == "call" {
+	if app.push == nil {
+		return
+	}
+	// Of the call records only a missed call is news; the caller wrote it,
+	// so everyone else gets "missed call".
+	if m.Kind == "call" && (m.Call == nil || m.Call.State != callMissed) {
 		return
 	}
 	go func() {
@@ -179,7 +218,7 @@ func (app *App) pushMessage(ctx context.Context, m *Message, sender *User) error
 		if uid == sender.ID {
 			continue
 		}
-		devs, err := app.pushDevices(ctx, uid)
+		devs, err := app.pushDevices(ctx, uid, pushKindAlert)
 		if err != nil {
 			return err
 		}
@@ -191,12 +230,63 @@ func (app *App) pushMessage(ctx context.Context, m *Message, sender *User) error
 			return err
 		}
 		for _, d := range devs {
-			err := app.push.Push(ctx, d, n)
-			if errors.Is(err, errPushGone) {
-				_, _ = app.db.ExecContext(ctx, `DELETE FROM push_devices WHERE token = ?`, d.Token)
-			} else if err != nil {
-				log.Printf("push: user %d: %v", uid, err)
-			}
+			app.pushResult(ctx, d, uid, app.push.Push(ctx, d, n))
+		}
+	}
+	return nil
+}
+
+// pushResult forgets dead tokens and logs other failures.
+func (app *App) pushResult(ctx context.Context, d PushDevice, uid int64, err error) {
+	if errors.Is(err, errPushGone) {
+		_, _ = app.db.ExecContext(ctx, `DELETE FROM push_devices WHERE token = ?`, d.Token)
+	} else if err != nil {
+		log.Printf("push %s: user %d: %v", d.Kind, uid, err)
+	}
+}
+
+// ---- incoming call → VoIP push ----
+
+// notifyCallRing wakes the other members' phones so they ring even when the
+// app is closed. Phones with the app open also get the realtime "call.ring";
+// the app shows the call through CallKit either way, so it rings once.
+func (app *App) notifyCallRing(c *Call, caller *User) {
+	if app.push == nil {
+		return
+	}
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		if err := app.pushCallRing(ctx, c, caller); err != nil {
+			log.Printf("push: call %d: %v", c.ID, err)
+		}
+	}()
+}
+
+func (app *App) pushCallRing(ctx context.Context, c *Call, caller *User) error {
+	var kind, title string
+	if err := app.db.QueryRowContext(ctx, `SELECT kind, title FROM chats WHERE id = ?`, c.ChatID).Scan(&kind, &title); err != nil {
+		return err
+	}
+	cp := CallPush{UUID: callUUID(c.ID), CallID: c.ID, ChatID: c.ChatID, CallerName: caller.DisplayName,
+		Title: caller.DisplayName, Video: c.Video}
+	if kind == "group" {
+		cp.Title = title
+	}
+	members, err := app.chatMemberIDs(ctx, c.ChatID)
+	if err != nil {
+		return err
+	}
+	for _, uid := range members {
+		if uid == caller.ID {
+			continue
+		}
+		devs, err := app.pushDevices(ctx, uid, pushKindVoIP)
+		if err != nil {
+			return err
+		}
+		for _, d := range devs {
+			app.pushResult(ctx, d, uid, app.push.PushCall(ctx, d, cp))
 		}
 	}
 	return nil
@@ -289,6 +379,28 @@ func (p *apnsPusher) Push(ctx context.Context, d PushDevice, n PushNote) error {
 	if err != nil {
 		return err
 	}
+	// Keep a message for a day if the phone is offline.
+	return p.send(ctx, d, "alert", p.topic, time.Now().Add(24*time.Hour).Unix(), body)
+}
+
+// PushCall sends a PushKit VoIP push: the app must report it to CallKit right
+// away. Expiration 0: a ring is useless later, so deliver now or never.
+func (p *apnsPusher) PushCall(ctx context.Context, d PushDevice, c CallPush) error {
+	body, err := json.Marshal(map[string]any{
+		"uuid":        c.UUID,
+		"call_id":     c.CallID,
+		"chat_id":     c.ChatID,
+		"caller_name": c.CallerName,
+		"title":       c.Title,
+		"video":       c.Video,
+	})
+	if err != nil {
+		return err
+	}
+	return p.send(ctx, d, "voip", p.topic+".voip", 0, body)
+}
+
+func (p *apnsPusher) send(ctx context.Context, d PushDevice, pushType, topic string, expiration int64, body []byte) error {
 	base := p.production
 	if d.Sandbox {
 		base = p.sandbox
@@ -302,10 +414,10 @@ func (p *apnsPusher) Push(ctx context.Context, d PushDevice, n PushNote) error {
 		return err
 	}
 	req.Header.Set("authorization", "bearer "+jwtTok)
-	req.Header.Set("apns-topic", p.topic)
-	req.Header.Set("apns-push-type", "alert")
+	req.Header.Set("apns-topic", topic)
+	req.Header.Set("apns-push-type", pushType)
 	req.Header.Set("apns-priority", "10")
-	req.Header.Set("apns-expiration", fmt.Sprint(time.Now().Add(24*time.Hour).Unix()))
+	req.Header.Set("apns-expiration", fmt.Sprint(expiration))
 	resp, err := p.client.Do(req)
 	if err != nil {
 		return err

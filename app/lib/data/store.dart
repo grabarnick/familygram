@@ -5,6 +5,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:uuid/uuid.dart';
 
 import 'api.dart';
+import 'callkit.dart';
 import 'models.dart';
 import 'push.dart';
 import 'realtime.dart';
@@ -22,22 +23,134 @@ typedef RealtimeFactory = Realtime Function(ApiClient api);
 
 /// Whole client state: session, users, chats, messages, realtime.
 class AppStore extends ChangeNotifier {
-  AppStore({ApiFactory? apiFactory, RealtimeFactory? realtimeFactory, PushService? push})
-      : _apiFactory = apiFactory ??
+  AppStore({
+    ApiFactory? apiFactory,
+    RealtimeFactory? realtimeFactory,
+    PushService? push,
+    CallKitService? callKit,
+  })  : _apiFactory = apiFactory ??
             ((url, token) => ApiClient(baseUrl: url, token: token)),
         _realtimeFactory =
             realtimeFactory ?? ((api) => Realtime(() => api.wsUri)),
         // ignore: prefer_initializing_formals (named parameters can't be private)
-        _push = push {
+        _push = push,
+        // ignore: prefer_initializing_formals
+        _callKit = callKit {
     final p = _push;
     if (p != null) {
       _tapSub = p.taps.listen((_) => _takeTappedChat());
       addListener(_syncBadge);
     }
+    _callKitSub = _callKit?.actions.listen(_onCallKitAction);
   }
 
-  /// Uses the device's push service (iOS); null elsewhere.
-  factory AppStore.forDevice() => AppStore(push: PushService.forPlatform());
+  /// Uses the device's push and call screen (iOS); null elsewhere.
+  factory AppStore.forDevice() =>
+      AppStore(push: PushService.forPlatform(), callKit: CallKitService.forPlatform());
+
+  // ---- incoming calls via the system call screen (CallKit) ----
+  final CallKitService? _callKit;
+  StreamSubscription<CallKitAction>? _callKitSub;
+
+  /// True once the server can wake this phone for calls: then the system
+  /// call screen rings and the in-app incoming screen stays hidden, so the
+  /// person never hears two rings.
+  bool callKitRings = false;
+
+  /// Joins a call accepted on the system call screen. Set by the UI at start;
+  /// called directly, not via a rebuild, because a locked phone draws no
+  /// frames and the answer must reach the server and LiveKit right away.
+  void Function(int callId)? onCallKitAccept;
+
+  /// Call accepted before [onCallKitAccept] was set; the UI takes it.
+  int? callKitAcceptRequest;
+
+  int? takeCallKitAcceptRequest() {
+    final id = callKitAcceptRequest;
+    callKitAcceptRequest = null;
+    return id;
+  }
+
+  void _acceptFromCallKit(int id) {
+    _handledIncoming.add(id);
+    _answeringHere.add(id);
+    if (incomingCall?.id == id) incomingCall = null;
+    final handler = onCallKitAccept;
+    if (handler != null) {
+      handler(id);
+    } else {
+      callKitAcceptRequest = id;
+    }
+    notifyListeners();
+  }
+
+  /// Call ended from the system call screen; the open call screen hangs up.
+  int? callKitEndRequest;
+
+  Future<void> _registerVoIP() async {
+    final ck = _callKit;
+    final api = _api;
+    if (ck == null || api == null || !isSignedIn) return;
+    try {
+      final token = await ck.voipToken();
+      if (token == null) return; // a tokenUpdated action brings it later
+      // Same signing as the message token: development build → APNs sandbox.
+      final sandbox = (await _pushRegister())?.sandbox ?? false;
+      final ok = await api.registerDevice(platform: 'ios', token: token, sandbox: sandbox, kind: 'voip');
+      if (callKitRings != ok) {
+        callKitRings = ok;
+        notifyListeners();
+      }
+    } catch (e) {
+      debugPrint('VoIP registration failed: $e');
+    }
+  }
+
+  Future<void> _onCallKitAction(CallKitAction a) async {
+    if (a.kind == CallKitActionKind.tokenUpdated) {
+      await _registerVoIP();
+      return;
+    }
+    final id = a.callId;
+    if (id == null || !isSignedIn) return;
+    switch (a.kind) {
+      case CallKitActionKind.accept:
+        _acceptFromCallKit(id);
+      case CallKitActionKind.decline:
+        _handledIncoming.add(id);
+        if (incomingCall?.id == id) incomingCall = null;
+        notifyListeners();
+        try {
+          await _api!.declineCall(id);
+        } catch (_) {}
+      case CallKitActionKind.ended:
+        // Hung up on the system screen (e.g. the lock screen) mid-call.
+        if (activeCall?.id == id) {
+          callKitEndRequest = id;
+          notifyListeners();
+        }
+      case CallKitActionKind.timeout:
+      case CallKitActionKind.tokenUpdated:
+        break;
+    }
+  }
+
+  /// The accepted call no longer exists on the server.
+  void callKitCallGone(int callId) => _endCallKit(callId);
+
+  /// Takes a call off the system call screen once it is over for this phone.
+  void _endCallKit(int callId) {
+    final ck = _callKit;
+    if (ck != null) unawaited(ck.endCall(callId).catchError((_) {}));
+  }
+
+  /// A call accepted on the system screen before Dart was listening (the
+  /// accept is what launched the app).
+  Future<void> _takeAcceptedCallKitCall() async {
+    final ids = await _callKit?.acceptedCalls().catchError((_) => <int>[]) ?? const <int>[];
+    if (ids.isEmpty || !isSignedIn || activeCall != null) return;
+    _acceptFromCallKit(ids.first);
+  }
 
   // ---- push ----
   final PushService? _push;
@@ -53,12 +166,25 @@ class AppStore extends ChangeNotifier {
     return id;
   }
 
+  /// One permission request / APNs registration per session, shared by the
+  /// message and the call registrations (two at once would cancel each other
+  /// in the native bridge).
+  Future<PushRegistration?>? _pushRegistration;
+
+  Future<PushRegistration?> _pushRegister() =>
+      _pushRegistration ??= (_push?.register() ?? Future.value(null))
+          .catchError((Object e) {
+        _pushRegistration = null; // retry next time
+        debugPrint('push registration failed: $e');
+        return null;
+      });
+
   Future<void> _registerPush() async {
     final p = _push;
     final api = _api;
     if (p == null || api == null) return;
     try {
-      final reg = await p.register();
+      final reg = await _pushRegister();
       if (reg == null || !isSignedIn) return; // notifications declined
       await api.registerDevice(platform: reg.platform, token: reg.token, sandbox: reg.sandbox);
     } catch (e) {
@@ -242,6 +368,10 @@ class AppStore extends ChangeNotifier {
   }
 
   Future<void> _clearSession() async {
+    callKitRings = false;
+    _pushRegistration = null;
+    callKitAcceptRequest = null;
+    callKitEndRequest = null;
     await _rt?.dispose();
     await _eventsSub?.cancel();
     await _statusSub?.cancel();
@@ -269,6 +399,8 @@ class AppStore extends ChangeNotifier {
     if (callsEnabled) unawaited(refreshCalls().catchError((_) {}));
     unawaited(_registerPush());
     unawaited(_takeTappedChat()); // the tap that launched the app
+    unawaited(_registerVoIP());
+    if (callsEnabled) unawaited(_takeAcceptedCallKitCall());
   }
 
   void _startRealtime() {
@@ -665,6 +797,9 @@ class AppStore extends ChangeNotifier {
   // ============================================================= events ===
 
   @visibleForTesting
+  void debugSetActiveCall(Call? c) => activeCall = c;
+
+  @visibleForTesting
   void debugSeed({required User me, List<User> users = const [], List<Chat> chats = const []}) {
     this.me = me;
     this.users
@@ -727,12 +862,18 @@ class AppStore extends ChangeNotifier {
   /// refresh does not bring their incoming screen back.
   final Set<int> _handledIncoming = {};
 
+  /// Calls this device is answering. The server's "call is active" event can
+  /// arrive before the reply to our own join; it must not read as "answered
+  /// elsewhere" and close the system call screen under us.
+  final Set<int> _answeringHere = {};
+
   /// The incoming screen is normally raised by the realtime "call ringing"
   /// event. If that event was missed — iOS suspends the app and drops the
   /// WebSocket while it is in the background or the screen is locked — the
   /// call still shows up in the list fetched on reconnect/resume. Ring for it
   /// then, so the person can still answer.
   void _surfaceRingingCall() {
+    if (callKitRings) return; // the system call screen rings instead
     if (incomingCall != null || activeCall != null) return;
     final myId = me?.id;
     if (myId == null) return;
@@ -770,6 +911,8 @@ class AppStore extends ChangeNotifier {
     _upsertHistory(c);
     if (c.initiatorId == me?.id) return; // my own outgoing call
     if (activeCall?.id == c.id) return;
+    // The VoIP push already rings on the system call screen.
+    if (callKitRings) return;
     // Busy in another call: don't interrupt; it stays in the join banner.
     if (activeCall == null) incomingCall = c;
   }
@@ -782,12 +925,20 @@ class AppStore extends ChangeNotifier {
     }
     _upsertHistory(c);
     if (activeCall?.id == c.id) activeCall = c;
+    final answeredByMe = c.participantIds.contains(me?.id);
+    final directAnswered = chatById(c.chatId)?.isGroup != true &&
+        c.state == CallState.active;
     final inc = incomingCall;
     if (inc != null && inc.id == c.id) {
-      final answeredByMe = c.participantIds.contains(me?.id);
-      final directAnswered = chatById(c.chatId)?.isGroup != true &&
-          c.state == CallState.active;
       if (!c.isLive || answeredByMe || directAnswered) incomingCall = null;
+    }
+    // Answered on another of my devices (or by someone else in a 1:1): stop
+    // the system call screen ringing here.
+    if (activeCall?.id != c.id &&
+        !_answeringHere.contains(c.id) &&
+        c.initiatorId != me?.id &&
+        (!c.isLive || directAnswered)) {
+      _endCallKit(c.id);
     }
   }
 
@@ -796,6 +947,7 @@ class AppStore extends ChangeNotifier {
     _upsertHistory(c);
     if (incomingCall?.id == c.id) incomingCall = null;
     if (activeCall?.id == c.id) activeCall = c; // UI sees !isLive and closes
+    _endCallKit(c.id); // caller hung up / nobody answered: stop ringing
   }
 
   /// Starts (or joins an already running) call in [chatId].
@@ -808,9 +960,22 @@ class AppStore extends ChangeNotifier {
     return j;
   }
 
+  /// A call that is still ringing or going on, by id; asks the server if the
+  /// realtime event was missed (the app was asleep when the call came).
+  Future<Call?> findLiveCall(int id) async {
+    bool match(Call c) => c.id == id;
+    var c = liveCalls.values.where(match).firstOrNull;
+    if (c == null) {
+      await refreshCalls().catchError((_) {});
+      c = callHistory.where(match).firstOrNull;
+    }
+    return (c != null && c.isLive) ? c : null;
+  }
+
   /// Accepts a ringing or joins an active call.
   Future<CallJoin> joinCall(Call c) async {
     _handledIncoming.add(c.id);
+    _answeringHere.add(c.id);
     final j = await _api!.joinCall(c.id);
     activeCall = j.call;
     if (incomingCall?.id == c.id) incomingCall = null;
@@ -844,8 +1009,10 @@ class AppStore extends ChangeNotifier {
   Future<void> leaveCall() async {
     final c = activeCall;
     activeCall = null;
+    if (callKitEndRequest == c?.id) callKitEndRequest = null;
     notifyListeners();
     if (c == null) return;
+    _endCallKit(c.id); // a call answered on the system screen shows there too
     try {
       await _api!.leaveCall(c.id);
     } catch (_) {}
@@ -914,6 +1081,7 @@ class AppStore extends ChangeNotifier {
   @override
   void dispose() {
     _tapSub?.cancel();
+    _callKitSub?.cancel();
     _typingTimer?.cancel();
     _eventsSub?.cancel();
     _statusSub?.cancel();

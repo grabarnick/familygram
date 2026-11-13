@@ -1,0 +1,87 @@
+# Familygram: Caddy front (custom build with caddy-l4, see caddy/Dockerfile).
+#
+# Everything goes through TCP 443 with automatic Let's Encrypt certificates:
+#   {$FG_DOMAIN}       web client, API, WebSocket, files  -> familygram:8080
+#   rtc.{$FG_DOMAIN}   LiveKit signaling (WebSocket)       -> livekit:7880
+#   turn.{$FG_DOMAIN}  LiveKit TURN over TLS (call media)  -> livekit:5349
+#
+# The layer4 listener wrapper looks at the TLS SNI of every new connection on
+# :443. For turn.* it terminates TLS itself and pipes raw TCP to LiveKit's TURN
+# port; everything else falls through to the normal HTTPS server. To the network
+# all three look like ordinary HTTPS. Certificates for all three names are
+# obtained via HTTP-01 on port 80.
+{
+	email {$FG_ACME_EMAIL}
+	servers :443 {
+		protocols h1 h2
+		listener_wrappers {
+			layer4 {
+				@turn tls sni turn.{$FG_DOMAIN}
+				route @turn {
+					tls
+					proxy livekit:5349
+				}
+			}
+			tls
+		}
+	}
+}
+
+(security_headers) {
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "same-origin"
+		X-Frame-Options "SAMEORIGIN"
+		Permissions-Policy "camera=(self), microphone=(self), geolocation=()"
+		-Server
+	}
+}
+
+{$FG_DOMAIN} {
+	encode zstd gzip
+
+	request_body {
+		max_size {$FG_MAX_UPLOAD_MB}MB
+	}
+
+	import security_headers
+
+	# WebSocket upgrade is handled transparently by reverse_proxy.
+	reverse_proxy familygram:8080 {
+		flush_interval -1
+		transport http {
+			read_timeout 0
+			write_timeout 0
+		}
+	}
+
+	log {
+		output stdout
+		format console
+	}
+}
+
+# LiveKit signaling: clients connect to wss://rtc.<domain>.
+rtc.{$FG_DOMAIN} {
+	import security_headers
+	reverse_proxy livekit:7880 {
+		flush_interval -1
+		transport http {
+			read_timeout 0
+			write_timeout 0
+		}
+	}
+}
+
+# This block only makes Caddy obtain and renew the certificate for turn.<domain>;
+# real TURN traffic never reaches the HTTP server (layer4 takes it first).
+# TLS-ALPN is disabled because layer4 intercepts that SNI before the HTTP server.
+turn.{$FG_DOMAIN} {
+	tls {
+		issuer acme {
+			disable_tlsalpn_challenge
+		}
+	}
+	respond 404
+}

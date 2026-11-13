@@ -1,0 +1,103 @@
+# Familygram: production deployment.
+#   cp .env.example .env   # set FG_DOMAIN, FG_ADMIN_PHONE, LiveKit keys
+#   docker compose up -d --build
+# (or simply run ./install.sh <domain> <admin-phone>)
+#
+# DNS: A records for <domain>, rtc.<domain>, turn.<domain> -> this server.
+# Public ports:
+#   80/tcp    ACME (Let's Encrypt) + redirect to HTTPS
+#   443/tcp   everything: app, API, WebSocket, LiveKit signaling, TURN/TLS
+#   7881/tcp  call media over TCP (optional fast path)
+#   7882/udp  call media over UDP (optional fast path, best quality)
+# When 7881/7882 are blocked, calls fall back to TURN over TLS on 443.
+
+name: familygram
+
+services:
+  familygram:
+    image: ${FG_IMAGE:-familygram:latest}
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      FG_SERVER_NAME: ${FG_SERVER_NAME:-Familygram}
+      FG_ADMIN_PHONE: ${FG_ADMIN_PHONE:?set FG_ADMIN_PHONE in .env}
+      FG_MAX_UPLOAD_MB: ${FG_MAX_UPLOAD_MB:-200}
+      FG_SMS_PROVIDER: ${FG_SMS_PROVIDER:-log}
+      FG_SMSRU_API_ID: ${FG_SMSRU_API_ID:-}
+      FG_SMSC_LOGIN: ${FG_SMSC_LOGIN:-}
+      FG_SMSC_PASSWORD: ${FG_SMSC_PASSWORD:-}
+      FG_TWILIO_SID: ${FG_TWILIO_SID:-}
+      FG_TWILIO_TOKEN: ${FG_TWILIO_TOKEN:-}
+      FG_TWILIO_FROM: ${FG_TWILIO_FROM:-}
+      # Calls (stage 2). Empty key/secret = calls disabled.
+      FG_LIVEKIT_URL: wss://rtc.${FG_DOMAIN:?set FG_DOMAIN in .env}
+      FG_LIVEKIT_API_KEY: ${FG_LIVEKIT_API_KEY:-}
+      FG_LIVEKIT_API_SECRET: ${FG_LIVEKIT_API_SECRET:-}
+    volumes:
+      - familygram-data:/data
+    expose:
+      - "8080"
+
+  # LiveKit SFU (calls) with its embedded TURN server.
+  # The whole config is passed via LIVEKIT_CONFIG so compose can substitute
+  # the domain and keys from .env (no template file to render).
+  livekit:
+    image: livekit/livekit-server:v1.13.11
+    restart: unless-stopped
+    environment:
+      LIVEKIT_CONFIG: |
+        port: 7880
+        log_level: info
+        rtc:
+          tcp_port: 7881
+          udp_port: 7882
+          use_external_ip: true
+        keys:
+          ${FG_LIVEKIT_API_KEY:?set FG_LIVEKIT_API_KEY in .env (install.sh generates it)}: ${FG_LIVEKIT_API_SECRET:?set FG_LIVEKIT_API_SECRET in .env}
+        turn:
+          enabled: true
+          domain: turn.${FG_DOMAIN}
+          # TLS is terminated by Caddy (layer4) on 443; LiveKit receives plain TCP
+          # on 5349 and advertises turns:turn.<domain>:443 to clients.
+          tls_port: 5349
+          external_tls: true
+          udp_port: 3478
+        webhook:
+          api_key: ${FG_LIVEKIT_API_KEY}
+          urls:
+            - http://familygram:8080/api/livekit/webhook
+        room:
+          empty_timeout: 60
+    ports:
+      - "7881:7881/tcp"
+      - "7882:7882/udp"
+    expose:
+      - "7880"
+      - "5349"
+
+  caddy:
+    build:
+      context: ./caddy
+    image: familygram-caddy:latest
+    restart: unless-stopped
+    depends_on:
+      - familygram
+      - livekit
+    ports:
+      - "80:80"
+      - "443:443/tcp"
+    environment:
+      FG_DOMAIN: ${FG_DOMAIN:?set FG_DOMAIN in .env}
+      FG_ACME_EMAIL: ${FG_ACME_EMAIL:-}
+      FG_MAX_UPLOAD_MB: ${FG_MAX_UPLOAD_MB:-200}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+
+volumes:
+  familygram-data:
+  caddy-data:
+  caddy-config:

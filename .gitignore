@@ -1,0 +1,31 @@
+.DS_Store
+.idea/
+.vscode/
+
+# server
+server/data/
+server/familygram
+server/web/
+
+# deploy secrets & state
+deploy/.env
+
+# local dev run: test database, uploaded files, server binary, LiveKit keys
+.run/
+
+# local Claude Code settings
+.claude/
+
+# flutter
+app/build/
+app/.dart_tool/
+app/.flutter-plugins
+app/.flutter-plugins-dependencies
+app/ios/Pods/
+app/ios/.symlinks/
+app/ios/Flutter/ephemeral/
+app/android/.gradle/
+app/android/local.properties
+app/android/key.properties
+*.jks
+*.keystore

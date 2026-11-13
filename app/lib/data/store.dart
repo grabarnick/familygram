@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 
 import 'package:flutter/foundation.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -208,6 +209,13 @@ class AppStore extends ChangeNotifier {
 
   static const _kServer = 'server_url';
   static const _kToken = 'token';
+
+  /// The signed-in user's profile, so the app opens signed in without a
+  /// connection instead of showing the login screen.
+  static const _kMe = 'me';
+
+  /// How long startup waits for the server before opening offline.
+  static const startupTimeout = Duration(seconds: 8);
   static const _kRelay = 'calls_force_relay';
   static const typingTtl = Duration(seconds: 5);
 
@@ -283,20 +291,47 @@ class AppStore extends ChangeNotifier {
     if (serverUrl != null && token != null) {
       _api = _apiFactory(serverUrl!, token);
       try {
-        me = await _api!.me();
+        me = await _api!.me().timeout(startupTimeout);
         needsName = me!.displayName.trim().isEmpty;
+        await _saveMe();
         await _afterSignIn();
       } on ApiException catch (e) {
         if (e.isUnauthorized) {
-          await _clearSession();
+          await _clearSession(); // signed out on the server: log in again
         } else {
-          // Offline: keep the token, retry via realtime reconnect.
-          me = null;
+          await _openOffline();
         }
+      } on TimeoutException {
+        await _openOffline();
       }
     }
     initialized = true;
     notifyListeners();
+  }
+
+  /// No connection at startup: the session is still valid, so open signed in
+  /// with the saved profile; realtime keeps reconnecting and catches up then.
+  Future<void> _openOffline() async {
+    final saved = _prefs?.getString(_kMe);
+    if (saved == null) return; // no profile saved yet: nothing to show
+    try {
+      me = User.fromJson(jsonDecode(saved) as Map<String, dynamic>);
+    } catch (_) {
+      return;
+    }
+    needsName = false;
+    _startedOffline = true;
+    users[me!.id] = me!;
+    _startRealtime();
+  }
+
+  /// Opened without a connection; the first realtime connect does the full
+  /// sign-in work that was skipped (see [_catchUp]).
+  bool _startedOffline = false;
+
+  Future<void> _saveMe() async {
+    final m = me;
+    if (m != null) await _prefs?.setString(_kMe, jsonEncode(m.toJson()));
   }
 
   /// Step 1: asks the server to send an SMS code.
@@ -335,6 +370,7 @@ class AppStore extends ChangeNotifier {
     needsName = res.isNew || res.user.displayName.trim().isEmpty;
     pendingPhone = null;
     await _prefs?.setString(_kToken, res.token);
+    await _saveMe();
     await _afterSignIn();
     notifyListeners();
   }
@@ -350,12 +386,14 @@ class AppStore extends ChangeNotifier {
     me = await _api!.updateMe(displayName: name.trim());
     users[me!.id] = me!;
     needsName = false;
+    await _saveMe();
     notifyListeners();
   }
 
   Future<void> updateAvatar(String fileId) async {
     me = await _api!.updateMe(avatarFileId: fileId);
     users[me!.id] = me!;
+    await _saveMe();
     notifyListeners();
   }
 
@@ -389,18 +427,47 @@ class AppStore extends ChangeNotifier {
     liveCalls.clear();
     callHistory = [];
     serverInfo = null;
+    _startedOffline = false;
     await _prefs?.remove(_kToken);
+    await _prefs?.remove(_kMe);
   }
 
   Future<void> _afterSignIn() async {
     if (me != null) users[me!.id] = me!;
     await Future.wait([refreshUsers(), refreshChats(), _loadServerInfo()]);
     _startRealtime();
+    _registerWithServer();
+  }
+
+  /// Calls, push and the system call screen: needs the server reachable.
+  void _registerWithServer() {
     if (callsEnabled) unawaited(refreshCalls().catchError((_) {}));
     unawaited(_registerPush());
     unawaited(_takeTappedChat()); // the tap that launched the app
     unawaited(_registerVoIP());
     if (callsEnabled) unawaited(_takeAcceptedCallKitCall());
+  }
+
+  /// First connection after an offline start: do what startup skipped.
+  Future<void> _finishOfflineStart() async {
+    try {
+      me = await _api!.me();
+    } on ApiException catch (e) {
+      if (e.isUnauthorized) {
+        await _clearSession();
+        notifyListeners();
+      }
+      return; // still unreachable: the next reconnect tries again
+    }
+    _startedOffline = false;
+    needsName = me!.displayName.trim().isEmpty;
+    users[me!.id] = me!;
+    await _saveMe();
+    await Future.wait([
+      refreshUsers().catchError((_) {}),
+      _loadServerInfo(),
+    ]);
+    _registerWithServer();
   }
 
   void _startRealtime() {
@@ -413,7 +480,8 @@ class AppStore extends ChangeNotifier {
     _statusSub = rt.statusChanges.listen((s) {
       connection = s;
       if (s == ConnectionStatus.connected) {
-        if (!first) _catchUp();
+        // After an offline start even the first connection must catch up.
+        if (!first || _startedOffline) _catchUp();
         first = false;
       }
       notifyListeners();
@@ -423,6 +491,10 @@ class AppStore extends ChangeNotifier {
 
   /// After a reconnect: reload chats and the newest page of the open chat.
   Future<void> _catchUp() async {
+    if (_startedOffline) {
+      await _finishOfflineStart();
+      if (!isSignedIn) return;
+    }
     await refreshChats();
     if (callsEnabled) await refreshCalls().catchError((_) {});
     final id = activeChatId;

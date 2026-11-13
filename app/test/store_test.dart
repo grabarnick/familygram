@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 
 import 'package:familygram/data/api.dart';
 import 'package:familygram/data/callkit.dart';
@@ -11,6 +12,8 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:stream_channel/stream_channel.dart';
+import 'package:web_socket_channel/web_socket_channel.dart';
 
 const me = User(id: 1, phone: '+71', displayName: 'Я');
 const mama = User(id: 2, phone: '+72', displayName: 'Мама');
@@ -517,6 +520,79 @@ void main() {
     });
   });
 
+  group('opening without a connection', () {
+    const mom = {'id': 2, 'phone': '+79990000002', 'display_name': 'Мама', 'is_admin': false};
+
+    // A saved session, as after a previous successful sign-in.
+    void savedSession({bool withProfile = true}) => SharedPreferences.setMockInitialValues({
+          'server_url': 'http://mac.local:8080',
+          'token': 'tok',
+          if (withProfile) 'me': jsonEncode(mom),
+        });
+
+    test('opens signed in with the saved profile and catches up when online', () async {
+      savedSession();
+      var online = false;
+      final client = MockClient((req) async {
+        if (!online) throw const SocketException('no route to host');
+        switch (req.url.path) {
+          case '/api/me':
+            return http.Response.bytes(utf8.encode(jsonEncode({...mom, 'display_name': 'Мама Оля'})), 200);
+          case '/api/chats':
+            return http.Response.bytes(
+                utf8.encode(jsonEncode([
+                  {'id': 1, 'kind': 'direct', 'title': 'Папа', 'member_ids': [1, 2], 'unread': 1}
+                ])),
+                200);
+          case '/api/users':
+          case '/api/calls':
+            return http.Response('[]', 200);
+          case '/api/info':
+            return http.Response(jsonEncode({'name': 'F', 'auth': 'sms', 'calls': true}), 200);
+        }
+        return http.Response('{}', 404);
+      });
+      final channel = FakeChannel();
+      final store = AppStore(
+        apiFactory: (url, token) => ApiClient(baseUrl: url, token: token, client: client),
+        realtimeFactory: (api) => Realtime(() => api.wsUri, connector: (_) => channel),
+      );
+      await store.init();
+      expect(store.isSignedIn, isTrue, reason: 'not the login screen');
+      expect(store.me?.displayName, 'Мама');
+      expect(store.chats, isEmpty);
+
+      online = true;
+      channel.connect();
+      await pumpEventQueue();
+      expect(store.me?.displayName, 'Мама Оля', reason: 'profile refreshed');
+      expect(store.chats.single.title, 'Папа', reason: 'chats loaded on reconnect');
+      expect(store.callsEnabled, isTrue);
+      final prefs = await SharedPreferences.getInstance();
+      expect(jsonDecode(prefs.getString('me')!)['display_name'], 'Мама Оля');
+      store.dispose();
+    });
+
+    test('without a saved profile it still shows the login screen', () async {
+      savedSession(withProfile: false);
+      final store = storeAnswering(() => throw const SocketException('offline'));
+      await store.init();
+      expect(store.isSignedIn, isFalse);
+      store.dispose();
+    });
+
+    test('a session revoked on the server signs out and forgets the profile', () async {
+      savedSession();
+      final store = storeAnswering(() => http.Response('{"error":"unauthorized"}', 401));
+      await store.init();
+      expect(store.isSignedIn, isFalse);
+      final prefs = await SharedPreferences.getInstance();
+      expect(prefs.getString('me'), isNull);
+      expect(prefs.getString('token'), isNull);
+      store.dispose();
+    });
+  });
+
   test('generic rate limit still fails and stays on the phone screen', () async {
     final store = storeAnswering(() => http.Response.bytes(
         utf8.encode(jsonEncode({'error': 'Слишком много запросов, попробуйте позже', 'retry_after': 3600})),
@@ -582,4 +658,38 @@ class FakeCallKit implements CallKitService {
 
   @override
   Future<void> endCall(int callId) async => ended.add(callId);
+}
+
+/// A WebSocket that "connects" when the test says so.
+class FakeChannel with StreamChannelMixin<dynamic> implements WebSocketChannel {
+  final _in = StreamController<dynamic>();
+  final _ready = Completer<void>();
+
+  void connect() => _ready.complete();
+
+  @override
+  Future<void> get ready => _ready.future;
+  @override
+  Stream<dynamic> get stream => _in.stream;
+  @override
+  WebSocketSink get sink => _FakeSink();
+  @override
+  String? get protocol => null;
+  @override
+  int? get closeCode => null;
+  @override
+  String? get closeReason => null;
+}
+
+class _FakeSink implements WebSocketSink {
+  @override
+  void add(dynamic data) {}
+  @override
+  void addError(Object error, [StackTrace? stackTrace]) {}
+  @override
+  Future<void> addStream(Stream<dynamic> stream) async {}
+  @override
+  Future<void> close([int? closeCode, String? closeReason]) async {}
+  @override
+  Future<void> get done => Future.value();
 }

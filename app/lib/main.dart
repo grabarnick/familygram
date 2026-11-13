@@ -53,7 +53,9 @@ class RootGate extends StatelessWidget {
     if (!store.initialized) {
       page = const Scaffold(body: Center(child: CircularProgressIndicator()));
     } else if (!store.isSignedIn) {
-      page = store.pendingPhone != null ? const CodeScreen() : const LoginScreen();
+      page = store.pendingPhone != null
+          ? CodeScreen(resendAfter: store.codeResendAfter)
+          : const LoginScreen();
     } else if (store.needsName) {
       page = const NameScreen();
     } else {

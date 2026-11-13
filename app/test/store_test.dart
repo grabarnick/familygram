@@ -187,6 +187,42 @@ void main() {
       expect(e.status, 429);
       expect(e.retryAfter, 42);
       expect(e.message, 'Подождите');
+      expect(e.codeSent, isFalse);
     }
+  });
+
+  AppStore storeAnswering(http.Response Function() requestCode) => AppStore(
+        apiFactory: (url, token) => ApiClient(
+          baseUrl: url,
+          token: token,
+          client: MockClient((req) async => requestCode()),
+        ),
+        realtimeFactory: (api) => Realtime(() => api.wsUri,
+            connector: (_) => throw UnsupportedError('no ws in tests')),
+      );
+
+  test('code already sent: goes to code entry with the remaining countdown', () async {
+    // User went back from the code screen and tapped "Get code" again within 60s.
+    final store = storeAnswering(() => http.Response.bytes(
+        utf8.encode(jsonEncode({'error': 'Код уже отправлен, подождите', 'retry_after': 37, 'code_sent': true})),
+        429));
+    await store.init();
+    expect(await store.requestCode('family.example.ru', '+79990000002'), 37);
+    expect(store.pendingPhone, '+79990000002');
+    expect(store.codeResendAfter, 37);
+    store.dispose();
+  });
+
+  test('generic rate limit still fails and stays on the phone screen', () async {
+    final store = storeAnswering(() => http.Response.bytes(
+        utf8.encode(jsonEncode({'error': 'Слишком много запросов, попробуйте позже', 'retry_after': 3600})),
+        429));
+    await store.init();
+    await expectLater(
+      store.requestCode('family.example.ru', '+79990000002'),
+      throwsA(isA<ApiException>().having((e) => e.status, 'status', 429)),
+    );
+    expect(store.pendingPhone, isNull);
+    store.dispose();
   });
 }

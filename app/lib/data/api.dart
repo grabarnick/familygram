@@ -14,7 +14,11 @@ class ApiException implements Exception {
   /// Seconds to wait before retrying (from a 429 `retry_after`).
   final int? retryAfter;
 
-  const ApiException(this.status, this.message, {this.retryAfter});
+  /// True when a 429 means "a code was already sent to this phone" (the
+  /// per-phone cooldown), as opposed to a generic rate limit.
+  final bool codeSent;
+
+  const ApiException(this.status, this.message, {this.retryAfter, this.codeSent = false});
 
   bool get isUnauthorized => status == 401;
   bool get isNetwork => status == 0;
@@ -101,6 +105,7 @@ class ApiClient {
       resp.statusCode,
       map['error'] as String? ?? 'Ошибка сервера (${resp.statusCode})',
       retryAfter: retry is num ? retry.toInt() : null,
+      codeSent: map['code_sent'] == true,
     );
   }
 

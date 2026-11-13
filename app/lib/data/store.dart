@@ -53,6 +53,9 @@ class AppStore extends ChangeNotifier {
   /// Phone a code was requested for (between requestCode and verify).
   String? pendingPhone;
 
+  /// Seconds until another code may be requested for [pendingPhone].
+  int codeResendAfter = 60;
+
   ConnectionStatus connection = ConnectionStatus.disconnected;
 
   // ---- data ----
@@ -119,11 +122,23 @@ class AppStore extends ChangeNotifier {
 
   /// Step 1: asks the server to send an SMS code.
   /// Returns seconds until another code can be requested.
+  ///
+  /// If a code was already sent to this phone and the resend cooldown is still
+  /// running (e.g. the user went back from the code screen and tapped "Get
+  /// code" again), this is not an error: the earlier code is still valid, so
+  /// we move on to code entry with the remaining countdown.
   Future<int> requestCode(String server, String phone) async {
     serverUrl = ApiClient.normalizeBaseUrl(server);
     _api = _apiFactory(serverUrl!, null);
-    final wait = await _api!.requestCode(phone.trim());
+    int wait;
+    try {
+      wait = await _api!.requestCode(phone.trim());
+    } on ApiException catch (e) {
+      if (!e.codeSent) rethrow;
+      wait = e.retryAfter ?? 60;
+    }
     pendingPhone = phone.trim();
+    codeResendAfter = wait > 0 ? wait : 60;
     await _prefs?.setString(_kServer, serverUrl!);
     notifyListeners();
     return wait;

@@ -206,11 +206,17 @@ func (app *App) handleInfo(w http.ResponseWriter, r *http.Request) error {
 	return nil
 }
 
-func writeRetry(w http.ResponseWriter, status int, msg string, retry int) {
+// writeRetry answers with a retry_after hint. codeSent marks the per-phone
+// cooldown: a valid code is already on its way, so the client can go straight
+// to code entry instead of showing an error (unlike the per-IP limit).
+func writeRetry(w http.ResponseWriter, status int, msg string, retry int, codeSent bool) {
 	w.Header().Set("Retry-After", fmt.Sprint(retry))
 	body := map[string]any{"retry_after": retry}
 	if msg != "" {
 		body["error"] = msg
+	}
+	if codeSent {
+		body["code_sent"] = true
 	}
 	writeJSON(w, status, body)
 }
@@ -242,12 +248,12 @@ func (app *App) handleRequestCode(w http.ResponseWriter, r *http.Request) error 
 	}
 	if err == nil {
 		if wait := time.UnixMilli(sentAt).Add(codeResendAfter).Sub(time.Now()); wait > 0 {
-			writeRetry(w, http.StatusTooManyRequests, "Код уже отправлен, подождите", int(wait.Seconds())+1)
+			writeRetry(w, http.StatusTooManyRequests, "Код уже отправлен, подождите", int(wait.Seconds())+1, true)
 			return nil
 		}
 	}
 	if !codeLimiter.allow(clientIP(r)) {
-		writeRetry(w, http.StatusTooManyRequests, "Слишком много запросов, попробуйте позже", int(ipWindow.Seconds()))
+		writeRetry(w, http.StatusTooManyRequests, "Слишком много запросов, попробуйте позже", int(ipWindow.Seconds()), false)
 		return nil
 	}
 

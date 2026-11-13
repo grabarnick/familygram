@@ -179,6 +179,10 @@ func TestAuthFlow(t *testing.T) {
 	if ra, _ := retry["retry_after"].(float64); ra <= 0 || ra > 60 {
 		t.Fatalf("retry_after = %v", retry)
 	}
+	// The client relies on this flag to open code entry rather than show an error.
+	if retry["code_sent"] != true {
+		t.Fatalf("code_sent = %v", retry)
+	}
 	e.must(401, "POST", "/api/auth/verify", "", map[string]string{"phone": adminPhone, "code": "000000x"}, nil)
 	var res authResponse
 	e.must(200, "POST", "/api/auth/verify", "", map[string]string{"phone": adminPhone, "code": e.sms.code(adminPhone)}, &res)

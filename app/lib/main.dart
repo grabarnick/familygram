@@ -43,8 +43,31 @@ class FamilygramApp extends StatelessWidget {
 }
 
 /// Picks the top-level screen from the session state.
-class RootGate extends StatelessWidget {
+class RootGate extends StatefulWidget {
   const RootGate({super.key});
+
+  @override
+  State<RootGate> createState() => _RootGateState();
+}
+
+class _RootGateState extends State<RootGate> {
+  // On return to the foreground, reconnect at once and catch a call that
+  // started ringing while iOS had the app suspended.
+  late final AppLifecycleListener _lifecycle = AppLifecycleListener(
+    onResume: () => context.read<AppStore>().onAppResumed(),
+  );
+
+  @override
+  void initState() {
+    super.initState();
+    _lifecycle; // create the listener
+  }
+
+  @override
+  void dispose() {
+    _lifecycle.dispose();
+    super.dispose();
+  }
 
   @override
   Widget build(BuildContext context) {

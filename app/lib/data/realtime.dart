@@ -66,6 +66,20 @@ class Realtime {
     await _status.close();
   }
 
+  /// Reconnects immediately if not connected, skipping the backoff delay.
+  /// Used when the app returns to the foreground: after iOS suspended it the
+  /// socket is gone, and waiting up to 30s would miss an incoming call.
+  void reconnectNow() {
+    if (!_running) return;
+    if (_current == ConnectionStatus.connected ||
+        _current == ConnectionStatus.connecting) {
+      return;
+    }
+    _reconnectTimer?.cancel();
+    _attempt = 0;
+    _connect();
+  }
+
   void sendTyping(int chatId) => _send('typing', {'chat_id': chatId});
 
   void _send(String type, Map<String, dynamic> data) {

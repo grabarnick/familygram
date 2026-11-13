@@ -664,8 +664,41 @@ class AppStore extends ChangeNotifier {
         liveCalls
           ..clear()
           ..addEntries(callHistory.where((c) => c.isLive).map((c) => MapEntry(c.chatId, c)));
+        _surfaceRingingCall();
         notifyListeners();
       });
+
+  /// Calls this device already answered, declined or dismissed, so a later
+  /// refresh does not bring their incoming screen back.
+  final Set<int> _handledIncoming = {};
+
+  /// The incoming screen is normally raised by the realtime "call ringing"
+  /// event. If that event was missed — iOS suspends the app and drops the
+  /// WebSocket while it is in the background or the screen is locked — the
+  /// call still shows up in the list fetched on reconnect/resume. Ring for it
+  /// then, so the person can still answer.
+  void _surfaceRingingCall() {
+    if (incomingCall != null || activeCall != null) return;
+    final myId = me?.id;
+    if (myId == null) return;
+    for (final c in callHistory) {
+      if (c.state == CallState.ringing &&
+          c.initiatorId != myId &&
+          !c.participantIds.contains(myId) &&
+          !_handledIncoming.contains(c.id)) {
+        incomingCall = c;
+        return;
+      }
+    }
+  }
+
+  /// The app came back to the foreground: reconnect right away (instead of
+  /// waiting out the reconnect backoff) and look for a call that is ringing.
+  void onAppResumed() {
+    if (!isSignedIn) return;
+    _rt?.reconnectNow();
+    if (callsEnabled) unawaited(refreshCalls().catchError((_) {}));
+  }
 
   void _upsertHistory(Call c) {
     final i = callHistory.indexWhere((x) => x.id == c.id);
@@ -722,6 +755,7 @@ class AppStore extends ChangeNotifier {
 
   /// Accepts a ringing or joins an active call.
   Future<CallJoin> joinCall(Call c) async {
+    _handledIncoming.add(c.id);
     final j = await _api!.joinCall(c.id);
     activeCall = j.call;
     if (incomingCall?.id == c.id) incomingCall = null;
@@ -733,7 +767,9 @@ class AppStore extends ChangeNotifier {
 
   /// Hides the incoming overlay without telling the server.
   void dismissIncoming() {
-    if (incomingCall == null) return;
+    final c = incomingCall;
+    if (c == null) return;
+    _handledIncoming.add(c.id);
     incomingCall = null;
     notifyListeners();
   }
@@ -741,6 +777,7 @@ class AppStore extends ChangeNotifier {
   Future<void> declineIncoming() async {
     final c = incomingCall;
     if (c == null) return;
+    _handledIncoming.add(c.id);
     incomingCall = null;
     notifyListeners();
     try {

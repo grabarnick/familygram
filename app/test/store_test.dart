@@ -213,6 +213,84 @@ void main() {
     store.dispose();
   });
 
+  group('ringing call missed while the realtime socket was down', () {
+    // Mom (id 2) is signed in on the phone; Dad (id 1) calls while iOS has the
+    // app suspended, so the "call ringing" event never arrives. The call list
+    // fetched on reconnect/resume must still raise the incoming screen.
+    Future<AppStore> signedInMom(List<Map<String, dynamic>> calls) async {
+      final client = MockClient((req) async {
+        switch (req.url.path) {
+          case '/api/auth/request-code':
+            return http.Response(jsonEncode({'retry_after': 60}), 200);
+          case '/api/auth/verify':
+            return http.Response.bytes(
+                utf8.encode(jsonEncode({
+                  'token': 'tok',
+                  'user': {'id': 2, 'phone': '+79990000002', 'display_name': 'Мама', 'is_admin': false},
+                  'is_new': false,
+                })),
+                200);
+          case '/api/info':
+            return http.Response(jsonEncode({'name': 'F', 'auth': 'sms', 'calls': true}), 200);
+          case '/api/calls':
+            return http.Response(jsonEncode(calls), 200);
+          case '/api/users':
+          case '/api/chats':
+            return http.Response('[]', 200);
+        }
+        return http.Response('{}', 404);
+      });
+      final store = AppStore(
+        apiFactory: (url, token) => ApiClient(baseUrl: url, token: token, client: client),
+        realtimeFactory: (api) => Realtime(() => api.wsUri,
+            connector: (_) => throw UnsupportedError('no ws in tests')),
+      );
+      await store.init();
+      await store.requestCode('family.example.ru', '+79990000002');
+      await store.verify('123456');
+      return store;
+    }
+
+    Map<String, dynamic> call(int id, {String state = 'ringing', int initiator = 1, List<int> participants = const [1]}) => {
+          'id': id,
+          'chat_id': 1,
+          'initiator_id': initiator,
+          'video': true,
+          'state': state,
+          'participant_ids': participants,
+          'created_at': 1794560000000,
+        };
+
+    test('a ringing call from someone else raises the incoming screen', () async {
+      final store = await signedInMom([call(13)]);
+      await store.refreshCalls();
+      expect(store.incomingCall?.id, 13);
+      store.dispose();
+    });
+
+    test('my own, answered or finished calls do not ring', () async {
+      final store = await signedInMom([
+        call(20, initiator: 2, participants: [2]), // my outgoing call
+        call(21, participants: [1, 2]), // I'm already in it
+        call(22, state: 'missed'),
+        call(23, state: 'active', participants: [1, 2]),
+      ]);
+      await store.refreshCalls();
+      expect(store.incomingCall, isNull);
+      store.dispose();
+    });
+
+    test('a declined call does not come back on the next refresh', () async {
+      final store = await signedInMom([call(13)]);
+      await store.refreshCalls();
+      expect(store.incomingCall?.id, 13);
+      await store.declineIncoming();
+      await store.refreshCalls(); // server may still report it ringing briefly
+      expect(store.incomingCall, isNull);
+      store.dispose();
+    });
+  });
+
   test('generic rate limit still fails and stays on the phone screen', () async {
     final store = storeAnswering(() => http.Response.bytes(
         utf8.encode(jsonEncode({'error': 'Слишком много запросов, попробуйте позже', 'retry_after': 3600})),

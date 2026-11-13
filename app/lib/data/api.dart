@@ -114,6 +114,11 @@ class ApiClient {
 
   // ---- server & auth ----
 
+  /// Registers this phone for push notifications (tied to the session).
+  Future<void> registerDevice({required String platform, required String token, required bool sandbox}) async {
+    await _send('POST', '/api/devices', body: {'platform': platform, 'token': token, 'sandbox': sandbox});
+  }
+
   Future<ServerInfo> info() async =>
       ServerInfo.fromJson(await _send('GET', '/api/info') as Map<String, dynamic>);
 

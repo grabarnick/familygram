@@ -105,6 +105,18 @@ CREATE TABLE IF NOT EXISTS call_participants (
 	left_at    INTEGER,
 	PRIMARY KEY (call_id, user_id)
 );
+
+-- Phones that receive push notifications. Bound to the sign-in session, so
+-- logging out (deleting the session) stops pushes to that phone.
+CREATE TABLE IF NOT EXISTS push_devices (
+	token        TEXT PRIMARY KEY,
+	user_id      INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+	session_hash TEXT NOT NULL REFERENCES sessions(token_hash) ON DELETE CASCADE,
+	platform     TEXT NOT NULL,
+	sandbox      INTEGER NOT NULL DEFAULT 0,
+	updated_at   INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS push_devices_user ON push_devices(user_id);
 `
 
 func openDB(path string) (*sql.DB, error) {

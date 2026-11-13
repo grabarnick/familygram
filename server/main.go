@@ -28,13 +28,21 @@ type Config struct {
 	LiveKitURL    string // public wss:// URL handed to clients
 	LiveKitKey    string
 	LiveKitSecret string
+
+	// Apple push (optional): .p8 key file, its Key ID, the Apple Team ID and
+	// the app's bundle ID.
+	APNsKeyFile string
+	APNsKeyID   string
+	APNsTeamID  string
+	APNsTopic   string
 }
 
 type App struct {
-	cfg Config
-	db  *sql.DB
-	hub *Hub
-	sms SMSSender
+	cfg  Config
+	db   *sql.DB
+	hub  *Hub
+	sms  SMSSender
+	push Pusher // nil: push notifications off
 
 	calls callRuntime
 }
@@ -67,7 +75,23 @@ func loadConfig() Config {
 		LiveKitURL:     os.Getenv("FG_LIVEKIT_URL"),
 		LiveKitKey:     os.Getenv("FG_LIVEKIT_API_KEY"),
 		LiveKitSecret:  os.Getenv("FG_LIVEKIT_API_SECRET"),
+		APNsKeyFile:    os.Getenv("FG_APNS_KEY_FILE"),
+		APNsKeyID:      os.Getenv("FG_APNS_KEY_ID"),
+		APNsTeamID:     os.Getenv("FG_APNS_TEAM_ID"),
+		APNsTopic:      env("FG_APNS_TOPIC", "org.familygram.familygram"),
 	}
+}
+
+// newPusher returns the configured push sender, or nil when push is not set up.
+func newPusher(cfg Config) (Pusher, error) {
+	if cfg.APNsKeyFile == "" {
+		return nil, nil
+	}
+	key, err := os.ReadFile(cfg.APNsKeyFile)
+	if err != nil {
+		return nil, fmt.Errorf("FG_APNS_KEY_FILE: %w", err)
+	}
+	return newAPNsPusher(key, cfg.APNsKeyID, cfg.APNsTeamID, cfg.APNsTopic)
 }
 
 func main() {
@@ -85,7 +109,11 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	app := &App{cfg: cfg, db: db, hub: newHub(), sms: sender}
+	pusher, err := newPusher(cfg)
+	if err != nil {
+		log.Fatal(err)
+	}
+	app := &App{cfg: cfg, db: db, hub: newHub(), sms: sender, push: pusher}
 
 	// CLI subcommands for self-hosters.
 	if len(os.Args) > 1 {
@@ -114,6 +142,10 @@ func main() {
 	}
 	if !app.callsEnabled() {
 		log.Printf("calls disabled: set FG_LIVEKIT_URL, FG_LIVEKIT_API_KEY, FG_LIVEKIT_API_SECRET")
+	}
+
+	if app.push == nil {
+		log.Printf("push notifications disabled: set FG_APNS_KEY_FILE, FG_APNS_KEY_ID, FG_APNS_TEAM_ID")
 	}
 
 	if cfg.AdminPhone == "" {

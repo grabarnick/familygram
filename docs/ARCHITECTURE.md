@@ -92,6 +92,7 @@ ID сообщений — монотонные int64 (пагинация `before
 | POST   | /api/files                        | multipart `file` (+ width/height/duration)|
 | GET    | /api/files/{id}                   | скачать (поддерживает Range)              |
 | GET    | /api/ws                           | WebSocket событий                         |
+| POST   | /api/devices                      | `{platform:"ios",token,sandbox}` — телефон для push; привязан к сессии, удаляется при выходе |
 
 События WebSocket (сервер → клиент): `message.new`, `message.deleted`,
 `chat.new`, `chat.read`, `typing`. Клиент → сервер: `typing`, позже —
@@ -203,3 +204,20 @@ iOS/Android/Web (`livekit_client`). Familygram-сервер отвечает т�
 
 Ограничение этапа 2: входящий звонок звонит, только пока приложение открыто
 (WebSocket). Звонок на закрытом телефоне — этап 3 (VoIP push + CallKit / FCM + ConnectionService).
+
+## Push-уведомления (этап 3)
+
+* Сервер шлёт в APNs напрямую (HTTP/2, токен-авторизация ключом `.p8`, ES256 JWT,
+  переподписывается раз в 40 мин), без Firebase. Настройка: `FG_APNS_KEY_FILE`,
+  `FG_APNS_KEY_ID`, `FG_APNS_TEAM_ID`, `FG_APNS_TOPIC` (bundle ID). Без ключа push выключен.
+* Таблица `push_devices(token, user_id, session_hash, platform, sandbox)`: токен
+  привязан к сессии (`ON DELETE CASCADE`), выход из аккаунта прекращает push на этот телефон.
+  Токены, на которые APNs отвечает 410/`BadDeviceToken`/`Unregistered`, удаляются.
+* `sandbox`: сборки с development-подписью получают токены песочницы APNs; клиент
+  определяет это по `aps-environment` в embedded.mobileprovision.
+* Новое сообщение → push всем участникам чата, кроме отправителя (в фоне, не задерживая
+  ответ). Личный чат: заголовок — имя отправителя; группа: название группы и «Имя: текст».
+  Вложения: «📷 Фото», «🎬 Видео», «🎤 Голосовое сообщение», «📎 имя файла».
+  `badge` — непрочитанные во всех чатах, `thread-id` — `chat-<id>`, `chat_id` — какой чат открыть.
+* Клиент iOS: нативный мост в `AppDelegate.swift` (канал `familygram/push`), Dart —
+  `lib/data/push.dart`. В открытом приложении уведомления не показываются.

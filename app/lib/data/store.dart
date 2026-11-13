@@ -6,6 +6,7 @@ import 'package:uuid/uuid.dart';
 
 import 'api.dart';
 import 'models.dart';
+import 'push.dart';
 import 'realtime.dart';
 
 /// Messages loaded for one chat, ascending by id (local unsent ones last).
@@ -21,11 +22,63 @@ typedef RealtimeFactory = Realtime Function(ApiClient api);
 
 /// Whole client state: session, users, chats, messages, realtime.
 class AppStore extends ChangeNotifier {
-  AppStore({ApiFactory? apiFactory, RealtimeFactory? realtimeFactory})
+  AppStore({ApiFactory? apiFactory, RealtimeFactory? realtimeFactory, PushService? push})
       : _apiFactory = apiFactory ??
             ((url, token) => ApiClient(baseUrl: url, token: token)),
         _realtimeFactory =
-            realtimeFactory ?? ((api) => Realtime(() => api.wsUri));
+            realtimeFactory ?? ((api) => Realtime(() => api.wsUri)),
+        // ignore: prefer_initializing_formals (named parameters can't be private)
+        _push = push {
+    final p = _push;
+    if (p != null) {
+      _tapSub = p.taps.listen((_) => _takeTappedChat());
+      addListener(_syncBadge);
+    }
+  }
+
+  /// Uses the device's push service (iOS); null elsewhere.
+  factory AppStore.forDevice() => AppStore(push: PushService.forPlatform());
+
+  // ---- push ----
+  final PushService? _push;
+  StreamSubscription<void>? _tapSub;
+  int? _badge;
+
+  /// Chat to open because its notification was tapped; the home screen takes it.
+  int? openChatRequest;
+
+  int? takeOpenChatRequest() {
+    final id = openChatRequest;
+    openChatRequest = null;
+    return id;
+  }
+
+  Future<void> _registerPush() async {
+    final p = _push;
+    final api = _api;
+    if (p == null || api == null) return;
+    try {
+      final reg = await p.register();
+      if (reg == null || !isSignedIn) return; // notifications declined
+      await api.registerDevice(platform: reg.platform, token: reg.token, sandbox: reg.sandbox);
+    } catch (e) {
+      debugPrint('push registration failed: $e');
+    }
+  }
+
+  Future<void> _takeTappedChat() async {
+    final id = await _push?.takeTappedChat().catchError((_) => null);
+    if (id == null || !isSignedIn) return;
+    openChatRequest = id;
+    notifyListeners();
+  }
+
+  void _syncBadge() {
+    final n = isSignedIn ? totalUnread : 0;
+    if (n == _badge) return;
+    _badge = n;
+    unawaited(_push?.setBadge(n).catchError((_) {}));
+  }
 
   static const _kServer = 'server_url';
   static const _kToken = 'token';
@@ -214,6 +267,8 @@ class AppStore extends ChangeNotifier {
     await Future.wait([refreshUsers(), refreshChats(), _loadServerInfo()]);
     _startRealtime();
     if (callsEnabled) unawaited(refreshCalls().catchError((_) {}));
+    unawaited(_registerPush());
+    unawaited(_takeTappedChat()); // the tap that launched the app
   }
 
   void _startRealtime() {
@@ -858,6 +913,7 @@ class AppStore extends ChangeNotifier {
 
   @override
   void dispose() {
+    _tapSub?.cancel();
     _typingTimer?.cancel();
     _eventsSub?.cancel();
     _statusSub?.cancel();

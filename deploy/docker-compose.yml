@@ -35,8 +35,16 @@ services:
       FG_LIVEKIT_URL: wss://rtc.${FG_DOMAIN:?set FG_DOMAIN in .env}
       FG_LIVEKIT_API_KEY: ${FG_LIVEKIT_API_KEY:-}
       FG_LIVEKIT_API_SECRET: ${FG_LIVEKIT_API_SECRET:-}
+      # iPhone push notifications (stage 3). Put the .p8 key into
+      # deploy/secrets/ and set FG_APNS_KEY_FILE=/secrets/<file>.p8 in .env.
+      # Empty FG_APNS_KEY_FILE = push disabled.
+      FG_APNS_KEY_FILE: ${FG_APNS_KEY_FILE:-}
+      FG_APNS_KEY_ID: ${FG_APNS_KEY_ID:-}
+      FG_APNS_TEAM_ID: ${FG_APNS_TEAM_ID:-}
+      FG_APNS_TOPIC: ${FG_APNS_TOPIC:-org.familygram.familygram}
     volumes:
       - familygram-data:/data
+      - ./secrets:/secrets:ro
     expose:
       - "8080"
 

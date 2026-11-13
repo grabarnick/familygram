@@ -98,6 +98,7 @@ func (app *App) routes() http.Handler {
 	mux.Handle("POST /api/files", app.authed(app.handleUpload))
 	mux.Handle("GET /api/files/{id}", app.authed(app.handleDownload))
 	mux.Handle("GET /api/ws", app.authed(app.handleWS))
+	mux.Handle("POST /api/devices", app.authed(app.handleRegisterDevice))
 	mux.Handle("POST /api/chats/{id}/call", app.authed(app.handleStartCall))
 	mux.Handle("POST /api/calls/{id}/join", app.authed(app.handleJoinCall))
 	mux.Handle("POST /api/calls/{id}/decline", app.authed(app.handleDeclineCall))

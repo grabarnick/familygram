@@ -14,7 +14,7 @@ void main() {
   WidgetsFlutterBinding.ensureInitialized();
   runApp(
     ChangeNotifierProvider(
-      create: (_) => AppStore()..init(),
+      create: (_) => AppStore.forDevice()..init(),
       child: const FamilygramApp(),
     ),
   );

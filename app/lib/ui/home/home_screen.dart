@@ -34,11 +34,33 @@ class _HomeScreenState extends State<HomeScreen> {
     _pane = _Pane.chat;
   });
 
+  bool _wideLayout = false;
+
+  /// A tapped notification asked to open a chat.
+  void _openRequested() {
+    final id = context.read<AppStore>().takeOpenChatRequest();
+    if (id == null || !mounted) return;
+    if (_wideLayout) {
+      _openWide(id);
+      return;
+    }
+    setState(() => _tab = 0);
+    // Replace whatever chat is open with the one from the notification.
+    Navigator.of(context).popUntil((r) => r.isFirst);
+    _openNarrow(id);
+  }
+
   @override
   Widget build(BuildContext context) {
+    final request = context.select<AppStore, int?>((s) => s.openChatRequest);
+    if (request != null) {
+      WidgetsBinding.instance.addPostFrameCallback((_) => _openRequested());
+    }
     return LayoutBuilder(
-      builder: (context, c) =>
-          c.maxWidth < Fg.wideBreakpoint ? _narrow(context) : _wide(context),
+      builder: (context, c) {
+        _wideLayout = c.maxWidth >= Fg.wideBreakpoint;
+        return _wideLayout ? _wide(context) : _narrow(context);
+      },
     );
   }
 

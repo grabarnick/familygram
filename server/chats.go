@@ -484,6 +484,7 @@ func (app *App) handleSendMessage(w http.ResponseWriter, r *http.Request, u *Use
 		return err
 	}
 	app.broadcastChat(ctx, chatID, "message.new", m, 0)
+	app.notifyNewMessage(m, u)
 	writeJSON(w, http.StatusOK, m)
 	return nil
 }

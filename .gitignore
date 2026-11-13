@@ -29,3 +29,6 @@ app/android/local.properties
 app/android/key.properties
 *.jks
 *.keystore
+
+# Apple push keys
+*.p8

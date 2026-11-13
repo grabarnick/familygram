@@ -1,7 +1,9 @@
+import 'dart:async';
 import 'dart:convert';
 
 import 'package:familygram/data/api.dart';
 import 'package:familygram/data/models.dart';
+import 'package:familygram/data/push.dart';
 import 'package:familygram/data/realtime.dart';
 import 'package:familygram/data/store.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -291,6 +293,96 @@ void main() {
     });
   });
 
+  group('push notifications', () {
+    late List<Map<String, dynamic>> devices;
+
+    Future<AppStore> signedIn(FakePush push) async {
+      devices = [];
+      final client = MockClient((req) async {
+        switch (req.url.path) {
+          case '/api/auth/request-code':
+            return http.Response(jsonEncode({'retry_after': 60}), 200);
+          case '/api/auth/verify':
+            return http.Response.bytes(
+                utf8.encode(jsonEncode({
+                  'token': 'tok',
+                  'user': {'id': 2, 'phone': '+79990000002', 'display_name': 'Мама', 'is_admin': false},
+                  'is_new': false,
+                })),
+                200);
+          case '/api/devices':
+            devices.add(jsonDecode(req.body) as Map<String, dynamic>);
+            return http.Response(jsonEncode({'ok': true, 'push': true}), 200);
+          case '/api/chats':
+            return http.Response.bytes(
+                utf8.encode(jsonEncode([
+                  {'id': 1, 'kind': 'direct', 'title': 'Папа', 'member_ids': [1, 2], 'unread': 2},
+                  {'id': 3, 'kind': 'group', 'title': 'Семья', 'member_ids': [1, 2, 3], 'unread': 1},
+                ])),
+                200);
+          case '/api/users':
+            return http.Response('[]', 200);
+          case '/api/auth/logout':
+            return http.Response('{"ok":true}', 200);
+        }
+        return http.Response('{}', 404);
+      });
+      final store = AppStore(
+        apiFactory: (url, token) => ApiClient(baseUrl: url, token: token, client: client),
+        realtimeFactory: (api) => Realtime(() => api.wsUri,
+            connector: (_) => throw UnsupportedError('no ws in tests')),
+        push: push,
+      );
+      await store.init();
+      await store.requestCode('family.example.ru', '+79990000002');
+      await store.verify('123456');
+      await pumpEventQueue();
+      return store;
+    }
+
+    test('after sign-in the phone is registered with the server', () async {
+      final store = await signedIn(FakePush(registration: const PushRegistration(
+          platform: 'ios', token: 'abcd1234', sandbox: true)));
+      expect(devices, [
+        {'platform': 'ios', 'token': 'abcd1234', 'sandbox': true}
+      ]);
+      store.dispose();
+    });
+
+    test('declined notifications: nothing is registered', () async {
+      final store = await signedIn(FakePush(registration: null));
+      expect(devices, isEmpty);
+      store.dispose();
+    });
+
+    test('tapping a notification asks to open its chat', () async {
+      final push = FakePush(registration: null);
+      final store = await signedIn(push);
+      expect(store.openChatRequest, isNull);
+      push.tap(3);
+      await pumpEventQueue();
+      expect(store.takeOpenChatRequest(), 3);
+      expect(store.openChatRequest, isNull);
+      store.dispose();
+    });
+
+    test('the tap that launched the app is picked up after sign-in', () async {
+      final push = FakePush(registration: null)..tapped = 1;
+      final store = await signedIn(push);
+      expect(store.openChatRequest, 1);
+      store.dispose();
+    });
+
+    test('the icon badge follows unread and clears on logout', () async {
+      final push = FakePush(registration: null);
+      final store = await signedIn(push);
+      expect(push.badges.last, 3);
+      await store.logout();
+      expect(push.badges.last, 0);
+      store.dispose();
+    });
+  });
+
   test('generic rate limit still fails and stays on the phone screen', () async {
     final store = storeAnswering(() => http.Response.bytes(
         utf8.encode(jsonEncode({'error': 'Слишком много запросов, попробуйте позже', 'retry_after': 3600})),
@@ -303,4 +395,34 @@ void main() {
     expect(store.pendingPhone, isNull);
     store.dispose();
   });
+}
+
+class FakePush implements PushService {
+  FakePush({required this.registration});
+
+  final PushRegistration? registration;
+  final badges = <int>[];
+  int? tapped;
+  final _taps = StreamController<void>.broadcast();
+
+  void tap(int chatId) {
+    tapped = chatId;
+    _taps.add(null);
+  }
+
+  @override
+  Stream<void> get taps => _taps.stream;
+
+  @override
+  Future<PushRegistration?> register() async => registration;
+
+  @override
+  Future<int?> takeTappedChat() async {
+    final id = tapped;
+    tapped = null;
+    return id;
+  }
+
+  @override
+  Future<void> setBadge(int count) async => badges.add(count);
 }
